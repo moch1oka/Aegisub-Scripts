@@ -1,7 +1,7 @@
 script_name = "Respread"
 script_description = "Replace line text, spreading the new text evenly across the existing ASS tag blocks."
 script_author = "17"
-script_version = "3.0"
+script_version = "3.3"
 
 local function is_drawing(text)
     return text:find("\\p[1-9]") ~= nil
@@ -59,6 +59,61 @@ local function split_text(text)
     return units
 end
 
+-- Optional step: glue every space to the character before it, so spaces never
+-- take a tag of their own (a leading space is glued to the next character).
+local function attach_spaces(units)
+    local merged = {}
+    local lead = ""
+    for _, u in ipairs(units) do
+        if u == " " then
+            if #merged > 0 then
+                merged[#merged] = merged[#merged] .. u
+            else
+                lead = lead .. u
+            end
+        else
+            merged[#merged + 1] = lead .. u
+            lead = ""
+        end
+    end
+    if lead ~= "" then merged[#merged + 1] = lead end
+    return merged
+end
+
+-- A unit ends a word if it carries a trailing space or is an explicit line break.
+local function ends_word(unit)
+    return unit:sub(-1) == " " or unit == "\\N" or unit == "\\n"
+end
+
+-- Used when there are fewer units than tags: the spare (empty) tags are placed right
+-- after word ends, so the silent beat falls between words instead of inside one.
+-- At most one empty tag per gap. Returns nil when that is not possible (single word,
+-- or more spare tags than gaps) so the caller can fall back to even spreading.
+local function place_in_word_gaps(units, n_tags)
+    local n_units = #units
+    local extra = n_tags - n_units
+
+    local gaps = {}
+    for i = 1, n_units - 1 do
+        if ends_word(units[i]) then gaps[#gaps + 1] = i end
+    end
+    local n_gaps = #gaps
+    if n_gaps == 0 or extra > n_gaps then return nil end
+
+    local empty_after = {}
+    for j = 0, extra - 1 do
+        local g = math.floor((j + 0.5) * n_gaps / extra) + 1
+        empty_after[gaps[g]] = true
+    end
+
+    local slots = {}
+    for i = 1, n_units do
+        slots[#slots + 1] = units[i]
+        if empty_after[i] then slots[#slots + 1] = "" end
+    end
+    return slots
+end
+
 local function normalize_new_text(text)
     text = text:gsub("\r\n?", "\n")
     text = text:gsub("^\n+", ""):gsub("\n+$", "")
@@ -66,23 +121,14 @@ local function normalize_new_text(text)
     return text
 end
 
-local distribution_methods = {
-    balanced = function(char_idx, n_chars, n_tags)
-        return math.floor((char_idx - 1 + 0.5) * n_tags / n_chars) + 1
-    end,
-
-    linear = function(char_idx, n_chars, n_tags)
-        if n_chars <= 1 then return 1 end
-        return math.floor((char_idx - 1) * (n_tags - 1) / (n_chars - 1) + 0.5) + 1
-    end
-}
-
-local function process_line(original_text, new_text, method)
+-- mode: "plain" | "attach" | "gaps"
+local function process_line(original_text, new_text, mode)
     local tags = extract_tag_groups(original_text)
 
     if #tags == 0 then return new_text end
 
     local chars = split_text(new_text)
+    if mode ~= "plain" then chars = attach_spaces(chars) end
     local n_tags = #tags
     local n_chars = #chars
     local text_per_tag = {}
@@ -91,12 +137,18 @@ local function process_line(original_text, new_text, method)
         text_per_tag[i] = ""
     end
 
+    local gap_slots = nil
+    if mode == "gaps" and n_tags > 1 and n_chars < n_tags then
+        gap_slots = place_in_word_gaps(chars, n_tags)
+    end
+
     if n_tags == 1 then
         text_per_tag[1] = new_text
+    elseif gap_slots then
+        text_per_tag = gap_slots
     else
-        local distribute = distribution_methods[method] or distribution_methods.balanced
         for i = 1, n_chars do
-            local idx = distribute(i, n_chars, n_tags)
+            local idx = math.floor((i - 1 + 0.5) * n_tags / n_chars) + 1
             text_per_tag[idx] = text_per_tag[idx] .. chars[i]
         end
     end
@@ -111,26 +163,27 @@ end
 function macro_replace_text(subtitles, selected_lines, active_line)
     local dialog_config = {
         {class="label", x=0, y=0, width=4, height=1, label="New text to insert:"},
-        {class="textbox", name="new_text", x=0, y=1, width=4, height=3, text=""},
+        {class="textbox", name="new_text", x=0, y=1, width=4, height=6, text=""},
 
-        {class="label", x=0, y=4, width=4, height=1, label="Balanced - most even (e.g. 10 chars → 3 tags = [4][3][3])"},
-        {class="label", x=0, y=5, width=4, height=1, label="Linear - symmetric, endpoint guarantee (e.g. 10 chars → 3 tags = [3][4][3])"}
+        {class="label", x=0, y=7, width=4, height=1, label="Plain: every character, spaces included, counts equally."},
+        {class="label", x=0, y=8, width=4, height=1, label="Attach spaces: each space sticks to the letter before it."},
+        {class="label", x=0, y=9, width=4, height=1, label="Attach + gaps: same, and spare tags go to the gaps between words."}
     }
 
-    local buttons = {"Balanced", "Linear", "Cancel"}
-    local pressed, result = aegisub.dialog.display(dialog_config, buttons, {cancel = "Cancel"})
+    local btn_plain = "Plain"
+    local btn_attach = "Attach spaces"
+    local btn_gaps = "Attach + gaps"
+    local modes = {[btn_plain] = "plain", [btn_attach] = "attach", [btn_gaps] = "gaps"}
+    local buttons = {btn_plain, btn_attach, btn_gaps, "Cancel"}
+    local pressed, result = aegisub.dialog.display(dialog_config, buttons, {ok = btn_plain, cancel = "Cancel"})
 
-    if pressed == "Cancel" then return end
+    local mode = modes[pressed]
+    if not mode then return end
 
     local new_text = normalize_new_text(result.new_text)
     if new_text == "" then
         aegisub.log("No new text entered, nothing changed.\n")
         return
-    end
-
-    local method = "balanced"
-    if pressed == "Linear" then
-        method = "linear"
     end
 
     local changed, skipped = 0, 0
@@ -141,7 +194,7 @@ function macro_replace_text(subtitles, selected_lines, active_line)
         if is_drawing(line.text) then
             skipped = skipped + 1
         else
-            line.text = process_line(line.text, new_text, method)
+            line.text = process_line(line.text, new_text, mode)
             subtitles[i] = line
             changed = changed + 1
         end
